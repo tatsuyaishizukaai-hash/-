@@ -872,38 +872,6 @@ function requiredPay(loan, bal) {
   return Number(loan.fixed) || 0;
 }
 
-/* 完済までを1か月ずつ積む */
-function simulate(loan, startYM, opt = {}) {
-  const extra = Math.max(0, Number(opt.extra ?? loan.extra) || 0);
-  const onceOnly = (opt.extraOnce ?? loan.extraOnce) !== false;
-  const bonusAmt = Math.max(0, Number(opt.bonusAmount ?? loan.bonusAmount) || 0);
-  const bonusMonths = opt.bonusMonths ?? loan.bonusMonths ?? [];
-  const apr = (Number(loan.apr) || 0) / 100;
-  let bal = Math.max(0, Number(loan.balance) || 0);
-  const fixedDue = requiredPay(loan, bal); // スライドを固定するときの基準
-  const rows = [];
-  let interestSum = 0;
-  let stuck = false;
-
-  for (let i = 0; i < 600 && bal > 0; i++) {
-    const ym = addMonths(startYM, i);
-    const { y, m } = parseYM(ym);
-    const days = daysInMonth(y, m);
-    const interest = Math.round(bal * apr / 365 * days);
-    const due = loan.reslide ? requiredPay(loan, bal) : fixedDue;
-    let pay = (loan.method === "prin" ? due + interest : due) + (onceOnly && i > 0 ? 0 : extra);
-    if (bonusMonths.includes(m)) pay += bonusAmt;
-    if (pay >= bal + interest) pay = bal + interest;
-    const principal = pay - interest;
-    if (principal <= 0) { stuck = true; break; }
-    bal = Math.max(0, bal - principal);
-    interestSum += interest;
-    rows.push({ ym, y, m, pay, interest, principal, bal });
-  }
-  const total = rows.reduce((s, r) => s + r.pay, 0);
-  return { rows, interestSum, total, months: rows.length, stuck, done: !stuck && bal <= 0, left: bal };
-}
-
 const mkLoan = (p) => ({
   id: Math.random().toString(36).slice(2, 10),
   name: p ? p.name : "借入先",
@@ -917,25 +885,72 @@ const mkLoan = (p) => ({
   prinSteps: p ? p.prinSteps : undefined,
   fixed: p && p.fixed ? p.fixed : 10000,
   reslide: false,
-  extra: 0,
-  extraOnce: true,
+  monthly: 0,
   bonusMonths: [],
   bonusAmount: 0,
   note: p ? p.note : "",
 });
 
+/* 月をまたいで残高を追う。plans[年月][借入先id] = その月だけの上乗せ */
+function walkLoan(loan, fromYM, plans, limit = 600) {
+  const apr = (Number(loan.apr) || 0) / 100;
+  let bal = Math.max(0, Number(loan.balance) || 0);
+  const baseDue = requiredPay(loan, bal);
+  const rows = {};
+  const order = [];
+  let interestSum = 0;
+  let stuck = false;
+
+  for (let i = 0; i < limit && bal > 0; i++) {
+    const ym = addMonths(fromYM, i);
+    const { y, m } = parseYM(ym);
+    const days = daysInMonth(y, m);
+    const open = bal;
+    const interest = Math.round(open * apr / 365 * days);
+    const due = loan.reslide ? requiredPay(loan, open) : baseDue;
+    const one = Math.max(0, Number((plans[ym] || {})[loan.id]) || 0);
+    const every = Math.max(0, Number(loan.monthly) || 0);
+    const bonus = (loan.bonusMonths || []).includes(m) ? Math.max(0, Number(loan.bonusAmount) || 0) : 0;
+    let pay = (loan.method === "prin" ? due + interest : due) + one + every + bonus;
+    if (pay >= open + interest) pay = open + interest;
+    const principal = pay - interest;
+    if (principal <= 0) { stuck = true; break; }
+    bal = Math.max(0, open - principal);
+    interestSum += interest;
+    rows[ym] = { ym, y, m, open, due, extra: one + every + bonus, one, pay, interest, principal, close: bal };
+    order.push(ym);
+  }
+  return { rows, order, interestSum, months: order.length, stuck, endYM: order.length ? order[order.length - 1] : null };
+}
+
+/* かせぎの繰り越し。使わなかったぶんは次の月に持ち越す */
+function carryUpTo(ym, fromYM, earnByMonth, plans) {
+  let carry = 0;
+  for (let i = 0; i < 600; i++) {
+    const k = addMonths(fromYM, i);
+    const earn = Number(earnByMonth[k]) || 0;
+    const alloc = Object.values(plans[k] || {}).reduce((s, v) => s + (Number(v) || 0), 0);
+    if (k === ym) return { carryIn: carry, earn, alloc, pool: carry + earn, left: carry + earn - alloc };
+    carry = carry + earn - alloc;
+    if (k > ym) break;
+  }
+  return { carryIn: 0, earn: 0, alloc: 0, pool: 0, left: 0 };
+}
+
 /* ---------- 返済プランのページ ---------- */
 function LoanPage({ active }) {
   const [loans, setLoans] = useState([]);
+  const [plans, setPlans] = useState({});
+  const [from, setFrom] = useState(todayYM());
   const [loaded, setLoaded] = useState(false);
   const [tab, setTab] = useState("list");
   const [editing, setEditing] = useState(null);
   const [adding, setAdding] = useState(false);
-  const [earned, setEarned] = useState(0);
-  const [saveError, setSaveError] = useState(false);
   const [dataPane, setDataPane] = useState(false);
-
-  const startYM = todayYM();
+  const [earnByMonth, setEarnByMonth] = useState({});
+  const [ym, setYm] = useState(todayYM());
+  const [dir, setDir] = useState(1);
+  const [saveError, setSaveError] = useState(false);
 
   useEffect(() => {
     let alive = true;
@@ -943,7 +958,24 @@ function LoanPage({ active }) {
       let v = null;
       try { const r = await storage.get(LOAN_KEY); v = r ? JSON.parse(r.value) : null; } catch (e) {}
       if (!alive) return;
-      if (v && Array.isArray(v.loans)) setLoans(v.loans);
+      if (v && Array.isArray(v.loans)) {
+        const start = v.from || todayYM();
+        if (v.plans) {
+          setLoans(v.loans);
+          setPlans(v.plans);
+        } else {
+          /* 前の形（借入先ごとに上乗せ1つ）からの引っ越し */
+          const p = {};
+          const ls = v.loans.map((l) => {
+            const ex = Math.max(0, Number(l.extra) || 0);
+            if (ex > 0 && l.extraOnce !== false) { p[start] = p[start] || {}; p[start][l.id] = ex; }
+            return { ...l, monthly: l.extraOnce === false ? ex : 0, extra: undefined, extraOnce: undefined };
+          });
+          setLoans(ls);
+          setPlans(p);
+        }
+        setFrom(start);
+      }
       setLoaded(true);
     })();
     return () => { alive = false; };
@@ -952,14 +984,12 @@ function LoanPage({ active }) {
   useEffect(() => {
     if (!loaded) return;
     (async () => {
-      try {
-        await storage.set(LOAN_KEY, JSON.stringify({ loans }));
-        setSaveError(false);
-      } catch (e) { setSaveError(true); }
+      try { await storage.set(LOAN_KEY, JSON.stringify({ loans, plans, from })); setSaveError(false); }
+      catch (e) { setSaveError(true); }
     })();
-  }, [loans, loaded]);
+  }, [loans, plans, from, loaded]);
 
-  /* このページを開くたび、かせぎカレンダーの今月ぶんを読み直す */
+  /* 開くたびに、かせぎカレンダーを月ごとに集計し直す */
   useEffect(() => {
     if (!active) return;
     let alive = true;
@@ -967,74 +997,89 @@ function LoanPage({ active }) {
       let v = null;
       try { const r = await storage.get(EARN_KEY); v = r ? JSON.parse(r.value) : null; } catch (e) {}
       if (!alive || !v) return;
-      const now = todayYM();
-      let s = 0;
-      Object.keys(v).forEach((k) => { if (k.slice(0, 7) === now) s += Number(v[k]?.amount) || 0; });
-      setEarned(s);
+      const map = {};
+      Object.keys(v).forEach((k) => {
+        const mk = k.slice(0, 7);
+        map[mk] = (map[mk] || 0) + (Number(v[k]?.amount) || 0);
+      });
+      setEarnByMonth(map);
     })();
     return () => { alive = false; };
   }, [active]);
 
-  /* 素の計画（最低返済のみ）と、上乗せありの計画 */
-  const base = useMemo(
-    () => loans.map((l) => ({ loan: l, sim: simulate(l, startYM, { extra: 0, bonusAmount: 0, bonusMonths: [] }) })),
-    [loans, startYM]
+  const { y, m } = parseYM(ym);
+  const isNow = ym === todayYM();
+  const before = monthDiff(from, ym) < 0;
+
+  /* いまの計画と、上乗せをやめた場合 */
+  const walks = useMemo(() => loans.map((l) => ({ loan: l, w: walkLoan(l, from, plans) })), [loans, from, plans]);
+  const bares = useMemo(
+    () => loans.map((l) => ({ loan: l, w: walkLoan({ ...l, monthly: 0, bonusAmount: 0 }, from, {}) })),
+    [loans, from]
   );
-  const plan = useMemo(() => loans.map((l) => ({ loan: l, sim: simulate(l, startYM) })), [loans, startYM]);
 
-  /* 今月の約定合計と、上乗せに回せるお金 */
-  const yakujo = base.reduce((s, p) => s + (p.sim.rows[0] ? p.sim.rows[0].pay : 0), 0);
-  const pool = earned;
-  const allocated = loans.reduce((s, l) => s + (Number(l.extra) || 0), 0);
-  const remain = pool - allocated;
-  const setExtraFor = (id, v) =>
-    setLoans((prev) => prev.map((l) => (l.id === id ? { ...l, extra: Math.max(0, Math.round(v) || 0) } : l)));
-  const setOnceFor = (id, v) =>
-    setLoans((prev) => prev.map((l) => (l.id === id ? { ...l, extraOnce: v } : l)));
+  const money = carryUpTo(ym, from, earnByMonth, plans);
+  const allocThis = Object.values(plans[ym] || {}).reduce((s, v) => s + (Number(v) || 0), 0);
+  const remain = money.pool - allocThis;
 
-  const totalBal = loans.reduce((s, l) => s + (Number(l.balance) || 0), 0);
-  const thisMonth = plan.reduce((s, p) => s + (p.sim.rows[0] ? p.sim.rows[0].pay : 0), 0);
-  const thisInt = plan.reduce((s, p) => s + (p.sim.rows[0] ? p.sim.rows[0].interest : 0), 0);
-  const anyStuck = plan.some((p) => p.sim.stuck);
+  const rowsThis = walks.map(({ loan, w }) => ({ loan, w, r: w.rows[ym] || null }));
+  const openSum = rowsThis.reduce((s, x) => s + (x.r ? x.r.open : 0), 0);
+  const paySum = rowsThis.reduce((s, x) => s + (x.r ? x.r.pay : 0), 0);
+  const intSum = rowsThis.reduce((s, x) => s + (x.r ? x.r.interest : 0), 0);
+  const dueSum = rowsThis.reduce((s, x) => s + (x.r ? x.r.due : 0), 0);
+  const closeSum = rowsThis.reduce((s, x) => s + (x.r ? x.r.close : 0), 0);
+  const anyStuck = walks.some((x) => x.w.stuck);
 
-  const lastYM = (list) => {
+  const lastOf = (list) => {
     let last = null;
-    list.forEach((p) => {
-      const r = p.sim.rows[p.sim.rows.length - 1];
-      if (r && (!last || r.ym > last)) last = r.ym;
-    });
+    list.forEach((x) => { if (x.w.endYM && (!last || x.w.endYM > last)) last = x.w.endYM; });
     return last;
   };
-  const endBase = lastYM(base);
-  const endPlan = lastYM(plan);
-  const intBase = base.reduce((s, p) => s + p.sim.interestSum, 0);
-  const intPlan = plan.reduce((s, p) => s + p.sim.interestSum, 0);
-  const saveMonths = endBase && endPlan ? monthDiff(endPlan, endBase) : 0;
+  const endPlan = lastOf(walks);
+  const endBare = lastOf(bares);
+  const intPlan = walks.reduce((s, x) => s + x.w.interestSum, 0);
+  const intBare = bares.reduce((s, x) => s + x.w.interestSum, 0);
+  const saveMonths = endBare && endPlan ? monthDiff(endPlan, endBare) : 0;
 
-  /* 残高の推移（全部の合計） */
   const curve = useMemo(() => {
-    const n = Math.min(120, Math.max(1, ...plan.map((p) => p.sim.months)));
+    const n = Math.min(120, Math.max(1, ...walks.map((x) => x.w.months)));
     const out = [];
     for (let i = 0; i < n; i++) {
+      const k = addMonths(from, i);
       let b = 0;
-      plan.forEach((p) => {
-        const r = p.sim.rows[i];
-        if (r) b += r.bal;
-        else if (p.sim.rows.length && i >= p.sim.rows.length) b += 0;
-        else b += Number(p.loan.balance) || 0;
-      });
-      out.push({ ym: addMonths(startYM, i), bal: b });
+      walks.forEach((x) => { const r = x.w.rows[k]; if (r) b += r.close; });
+      out.push({ ym: k, bal: b });
     }
     return out;
-  }, [plan, startYM]);
+  }, [walks, from]);
+
+  const jump = (next) => { setDir(next > ym ? 1 : -1); setYm(next); };
+  const setOne = (loanId, v) =>
+    setPlans((prev) => {
+      const n = { ...prev, [ym]: { ...(prev[ym] || {}) } };
+      const amt = Math.max(0, Math.round(Number(v) || 0));
+      if (!amt) delete n[ym][loanId]; else n[ym][loanId] = amt;
+      if (!Object.keys(n[ym]).length) delete n[ym];
+      return n;
+    });
 
   const save = (l) => {
     setLoans((prev) => (prev.some((x) => x.id === l.id) ? prev.map((x) => (x.id === l.id ? l : x)) : [...prev, l]));
     setEditing(null);
   };
-  const remove = (id) => { setLoans((prev) => prev.filter((x) => x.id !== id)); setEditing(null); };
-
-  const endLabel = (ym) => { if (!ym) return "—"; const { y, m } = parseYM(ym); return `${y}年${m}月`; };
+  const remove = (id) => {
+    setLoans((prev) => prev.filter((x) => x.id !== id));
+    setPlans((prev) => {
+      const n = {};
+      Object.keys(prev).forEach((k) => {
+        const o = { ...prev[k] }; delete o[id];
+        if (Object.keys(o).length) n[k] = o;
+      });
+      return n;
+    });
+    setEditing(null);
+  };
+  const endLabel = (k) => { if (!k) return "—"; const p = parseYM(k); return `${p.y}年${p.m}月`; };
 
   return (
     <div className="sc">
@@ -1046,217 +1091,211 @@ function LoanPage({ active }) {
 
         <div className="lcd">
           <div className="lcd-row">
-            <span className="lcd-small">借入残高の合計</span>
+            <button className="nav" onClick={() => jump(addMonths(ym, -1))} aria-label="前の月">◀</button>
+            <span className={"lcd-ym " + (dir > 0 ? "dr" : "dl")} key={ym}>{y}<i>年</i>{m}<i>月</i></span>
+            <button className="nav" onClick={() => jump(addMonths(ym, 1))} aria-label="次の月">▶</button>
           </div>
-          <Rolling value={totalBal} className="lcd-total" />
+
+          <Rolling value={openSum} className="lcd-total" />
+          <div className="lcd-row"><span className="lcd-small">{m}月はじめの残高</span></div>
+
           <div className="lcd-foot">
-            <span>今月の支払い {yen(thisMonth)}</span>
-            <span>うち利息 {yen(thisInt)}</span>
+            <span>この月にはらう {yen(paySum)}</span>
+            <span>うち利息 {yen(intSum)}</span>
           </div>
           <div className="lcd-foot">
-            <span>完済の見込み {endLabel(endPlan)}</span>
-            <span>{plan.length ? `残り${Math.max(...plan.map((p) => p.sim.months))}回` : "—"}</span>
+            <span>月末の残高 {yen(closeSum)}</span>
+            <span>完済 {endLabel(endPlan)}</span>
           </div>
         </div>
 
+        <div className="keys2">
+          {!isNow && <button className="k sm now" onClick={() => jump(todayYM())}>今月</button>}
+        </div>
+
         <div className="tabs">
-          {[["list", "借入先"], ["table", "月々の内訳"], ["fast", "早く返す"]].map(([k, l]) => (
+          {[["list", "借入先"], ["table", "この先の推移"], ["fast", "上乗せ"]].map(([k, l]) => (
             <button key={k} className={"k tab " + (tab === k ? "k-on" : "")} onClick={() => setTab(k)}>{l}</button>
           ))}
         </div>
       </div>
 
-      {saveError && <p className="warn">保存できませんでした。書き出しから控えを取っておいてください。</p>}
-      {anyStuck && <p className="warn">利息のほうが支払いより大きくて、元金が減らない借入先があります。返済額を上げるか、貸金業協会の相談窓口（0570-051-051）で相談できます。</p>}
+      {saveError && <p className="warn">保存できませんでした。「データ」から控えを取っておいてください。</p>}
+      {anyStuck && <p className="warn">利息のほうが支払いより大きくて、元金が減らない借入先があります。返済額を上げるか、日本貸金業協会の相談窓口（0570-051-051）で相談できます。</p>}
+      {before && <p className="hint">この月は計画のはじまり（{endLabel(from)}）より前なので、まだ数字がありません。</p>}
 
       {!loans.length && (
         <section className="list empty">
           <p className="empty-lead">まだ1件も入っていません。</p>
-          <p className="hint">明細を見ながら、残高・金利・毎月の返済額を入れると、完済までの月数と利息の総額が出ます。</p>
+          <p className="hint">明細を見ながら、残高・金利・毎月の返済額を入れると、月ごとに残高がどう減っていくかを追えます。</p>
           <button className="k k-add" onClick={() => setAdding(true)}><span className="plus">＋</span> 借入先を追加する</button>
         </section>
       )}
 
       {!!loans.length && tab === "list" && (
         <section className="list">
-          {plan.map(({ loan, sim }) => {
-            const r0 = sim.rows[0];
-            const b = base.find((x) => x.loan.id === loan.id);
-            const intPct = r0 && r0.pay > 0 ? Math.round((r0.interest / r0.pay) * 100) : 0;
+          {rowsThis.map(({ loan, w, r }) => {
+            const intPct = r && r.pay > 0 ? Math.round((r.interest / r.pay) * 100) : 0;
             return (
               <button key={loan.id} className="loan" onClick={() => setEditing(loan)}>
                 <div className="loan-top">
                   <b>{loan.name}</b>
-                  <span className="loan-bal">{yen(loan.balance)}</span>
+                  <span className="loan-bal">{r ? yen(r.open) : "完済"}</span>
                 </div>
                 <div className="loan-sub">
                   年{Number(loan.apr).toFixed(2).replace(/\.?0+$/, "")}%・{METHOD_LABEL[loan.method]}
                 </div>
-                {r0 ? (
+                {r ? (
                   <>
                     <div className="bar2" aria-hidden="true">
                       <span className="bar2-i" style={{ width: intPct + "%" }} />
                       <span className="bar2-p" style={{ width: 100 - intPct + "%" }} />
                     </div>
                     <div className="loan-row">
-                      <span>今月 {yen(r0.pay)}</span>
-                      <span className="i-int">利息 {yen(r0.interest)}</span>
-                      <span className="i-pri">元金 {yen(r0.principal)}</span>
+                      <span>{m}月 {yen(r.pay)}{r.extra > 0 ? `（上乗せ ${num(r.extra)}）` : ""}</span>
+                      <span className="i-int">利息 {yen(r.interest)}</span>
+                      <span className="i-pri">元金 {yen(r.principal)}</span>
                     </div>
                     <div className="loan-row2">
-                      <span>{sim.stuck ? "元金が減りません" : `${endLabel(sim.rows[sim.rows.length - 1].ym)}に完済（あと${sim.months}回）`}</span>
-                      <span>利息 {yen(sim.interestSum)}</span>
+                      <span>月末 {yen(r.close)}</span>
+                      <span>{w.stuck ? "元金が減りません" : `${endLabel(w.endYM)}に完済`}</span>
                     </div>
-                    {b && b.sim.months > sim.months && (
-                      <div className="loan-win">上乗せで{b.sim.months - sim.months}か月ぶん短縮、利息{yen(b.sim.interestSum - sim.interestSum)}減</div>
-                    )}
                   </>
                 ) : (
-                  <div className="loan-row2"><span>残高を入れると計算します</span></div>
+                  <div className="loan-row2"><span>{w.endYM && w.endYM < ym ? `${endLabel(w.endYM)}に完済ずみ` : "残高を入れると計算します"}</span></div>
                 )}
               </button>
             );
           })}
+          <div className="total-line">
+            <span>{m}月の支払い合計</span>
+            <b>{yen(paySum)}</b>
+          </div>
           <button className="k k-add" onClick={() => setAdding(true)}><span className="plus">＋</span> 借入先を追加する</button>
           <p className="hint">
-            残高スライドは「最後に借りたときの残高」で返済額が決まる会社が多く、返しても自動では下がりません。下げるには会社への申し出が要ります。
+            上乗せしたぶんは翌月の残高に反映されます。前の月にさかのぼって金額を直すと、そこから先が全部つながって変わります。
           </p>
         </section>
       )}
 
       {!!loans.length && tab === "table" && (
         <section className="list">
-          <p className="sub">残高の推移</p>
+          <p className="sub">残高の推移（{endLabel(from)}から）</p>
           <div className="curve">
             {curve.slice(0, 60).map((c, i) => {
               const max = curve[0] ? curve[0].bal : 1;
               const h = max > 0 ? Math.max(2, Math.round((c.bal / max) * 100)) : 2;
               return (
-                <div className="cv" key={c.ym} title={c.ym}>
+                <div className={"cv" + (c.ym === ym ? " on" : "")} key={c.ym}>
                   <span style={{ height: h + "%" }} />
                   {i % 12 === 0 && <em>{parseYM(c.ym).y % 100}</em>}
                 </div>
               );
             })}
           </div>
-          <p className="hint">棒は月末の残高の合計です。目盛りは年の下2桁。</p>
+          <p className="hint">棒は月末の残高の合計です。色が濃い棒がいま見ている月。</p>
 
-          {plan.map(({ loan, sim }) => (
-            <div key={loan.id} className="tblwrap">
-              <p className="sub">{loan.name}</p>
-              <table className="tbl">
-                <thead>
-                  <tr><th>月</th><th>支払い</th><th>利息</th><th>元金</th><th>残高</th></tr>
-                </thead>
-                <tbody>
-                  {sim.rows.slice(0, 24).map((r) => (
-                    <tr key={r.ym}>
-                      <td>{r.m}月</td>
-                      <td>{num(r.pay)}</td>
-                      <td className="i-int">{num(r.interest)}</td>
-                      <td className="i-pri">{num(r.principal)}</td>
-                      <td>{num(r.bal)}</td>
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
-              {sim.rows.length > 24 && <p className="hint">このあと{sim.rows.length - 24}回つづきます。総額 {yen(sim.total)}（うち利息 {yen(sim.interestSum)}）</p>}
-            </div>
-          ))}
+          {walks.map(({ loan, w }) => {
+            const list = w.order.filter((k) => k >= ym).slice(0, 24);
+            if (!list.length) return null;
+            return (
+              <div key={loan.id} className="tblwrap">
+                <p className="sub">{loan.name}</p>
+                <table className="tbl">
+                  <thead>
+                    <tr><th>月</th><th>支払い</th><th>利息</th><th>元金</th><th>残高</th></tr>
+                  </thead>
+                  <tbody>
+                    {list.map((k) => {
+                      const r = w.rows[k];
+                      return (
+                        <tr key={k} className={r.one > 0 ? "hi" : ""}>
+                          <td>{r.m}月</td>
+                          <td>{num(r.pay)}</td>
+                          <td className="i-int">{num(r.interest)}</td>
+                          <td className="i-pri">{num(r.principal)}</td>
+                          <td>{num(r.close)}</td>
+                        </tr>
+                      );
+                    })}
+                  </tbody>
+                </table>
+                <p className="hint">{endLabel(w.endYM)}に完済。利息の総額 {yen(w.interestSum)}</p>
+              </div>
+            );
+          })}
         </section>
       )}
 
       {!!loans.length && tab === "fast" && (
         <section className="list">
           <div className="pool">
-            <div className="pool-row bd first"><span>上乗せに回せる</span><b>{yen(pool)}</b></div>
-            <div className="pool-row"><span>今月のかせぎから</span><b>{yen(earned)}</b></div>
-            <div className="pool-row"><span>割りふり済み</span><b>{yen(allocated)}</b></div>
+            <div className="pool-row bd first"><span>{m}月に上乗せに回せる</span><b>{yen(money.pool)}</b></div>
+            <div className="pool-row"><span>先月からの繰り越し</span><b>{yen(money.carryIn)}</b></div>
+            <div className="pool-row"><span>{m}月のかせぎ</span><b>{yen(money.earn)}</b></div>
+            <div className="pool-row"><span>この月に割りふり済み</span><b>{yen(allocThis)}</b></div>
             <div className="pool-bar" aria-hidden="true">
-              <span style={{ width: Math.min(100, pool > 0 ? (allocated / pool) * 100 : allocated > 0 ? 100 : 0) + "%" }}
-                className={remain < 0 ? "over" : ""} />
+              <span className={remain < 0 ? "over" : ""}
+                style={{ width: Math.min(100, money.pool > 0 ? (allocThis / money.pool) * 100 : allocThis > 0 ? 100 : 0) + "%" }} />
             </div>
             <div className="pool-left">
               {remain >= 0
-                ? <>まだ割りふれる <b>{yen(remain)}</b></>
-                : <b className="i-int">{yen(-remain)} 多く割りふっています</b>}
+                ? <>のこり <b>{yen(remain)}</b>（使わなければ来月へ繰り越し）</>
+                : <b className="i-int">{yen(-remain)} 足りません</b>}
             </div>
           </div>
 
           <p className="hint">
-            ここで扱うのは上乗せぶんだけです。約定返済{yakujo > 0 ? `（毎月 ${yen(yakujo)}）` : ""}はこれとは別にかかります。
-            {earned === 0 && "　いまは「かせぎ」のページが空なので、回せる額は0のままです。"}
+            ここで扱うのは上乗せぶんだけです。約定返済{dueSum > 0 ? `（${m}月は ${yen(dueSum)}）` : ""}はこれとは別にかかります。
           </p>
 
-          {plan.map(({ loan, sim }) => {
-            const b = base.find((x) => x.loan.id === loan.id);
-            const r0 = sim.rows[0];
-            const due = b && b.sim.rows[0] ? b.sim.rows[0].pay : 0;
-            const ex = Number(loan.extra) || 0;
-            const once = loan.extraOnce !== false;
-            const add = (v) => setExtraFor(loan.id, ex + v);
-            const shorter = b && !sim.stuck && !b.sim.stuck ? b.sim.months - sim.months : 0;
-            const saved = b && !sim.stuck && !b.sim.stuck ? b.sim.interestSum - sim.interestSum : 0;
+          {rowsThis.map(({ loan, w, r }) => {
+            if (!r) return null;
+            const one = Math.max(0, Number((plans[ym] || {})[loan.id]) || 0);
+            const add = (v) => setOne(loan.id, one + v);
             return (
               <div className="alloc" key={loan.id}>
                 <div className="alloc-top">
                   <b>{loan.name}</b>
-                  <span className="loan-bal">{yen(loan.balance)}</span>
+                  <span className="loan-bal">{yen(r.open)}</span>
                 </div>
-                <div className="alloc-sub">約定 {yen(due)}／今月はらう {yen(r0 ? r0.pay : due)}</div>
+                <div className="alloc-sub">約定 {yen(r.due)}／{m}月にはらう {yen(r.pay)}</div>
 
                 <div className="row">
-                  <span>上乗せする額</span>
-                  <input className="fld" type="number" inputMode="numeric" value={ex}
-                    onChange={(e) => setExtraFor(loan.id, Number(e.target.value) || 0)} />
+                  <span>{m}月だけの上乗せ</span>
+                  <input className="fld" type="number" inputMode="numeric" value={one}
+                    onChange={(e) => setOne(loan.id, e.target.value)} />
                 </div>
                 <div className="quick">
                   {[1000, 5000, 10000, 30000].map((v) => (
                     <button key={v} className="k k-line sm" onClick={() => add(v)}>＋{num(v)}</button>
                   ))}
-                  {remain > 0 && <button className="k k-line sm" onClick={() => add(remain)}>残り全部</button>}
-                  {ex > 0 && <button className="k k-line sm" onClick={() => setExtraFor(loan.id, 0)}>0にする</button>}
+                  {remain > 0 && <button className="k k-line sm" onClick={() => add(remain)}>のこり全部</button>}
+                  {one > 0 && <button className="k k-line sm" onClick={() => setOne(loan.id, 0)}>0にする</button>}
                 </div>
 
-                {ex > 0 && (
-                  <div className="onceseg">
-                    <button className={"k k-line sm" + (once ? " on" : "")} onClick={() => setOnceFor(loan.id, true)}>今月だけ</button>
-                    <button className={"k k-line sm" + (!once ? " on" : "")} onClick={() => setOnceFor(loan.id, false)}>毎月つづける</button>
-                  </div>
-                )}
-
-                {r0 && (
-                  <div className="alloc-res">
-                    <div className="bd-row"><span>今月はらったあとの残高</span><b>{yen(r0.bal)}</b></div>
-                    <div className="bd-row"><span>うち元金がへる額</span><b className="i-pri">{yen(r0.principal)}</b></div>
-                    <div className="bd-row">
-                      <span>完済まで</span>
-                      <b>{sim.stuck ? "減りません" : `${sim.months}回`}{shorter > 0 ? `（${shorter}か月みじかく）` : ""}</b>
-                    </div>
-                    <div className="bd-row">
-                      <span>上乗せのしかた</span>
-                      <b>{once ? "今月だけ" : "毎月つづける"}</b>
-                    </div>
-                    <div className="bd-row">
-                      <span>利息の総額</span>
-                      <b>{sim.stuck ? "—" : yen(sim.interestSum)}{saved > 0 ? ` （−${num(saved)}）` : ""}</b>
-                    </div>
-                  </div>
-                )}
+                <div className="alloc-res">
+                  <div className="bd-row"><span>この月のあとの残高</span><b>{yen(r.close)}</b></div>
+                  <div className="bd-row"><span>うち元金がへる額</span><b className="i-pri">{yen(r.principal)}</b></div>
+                  <div className="bd-row"><span>完済</span><b>{w.stuck ? "減りません" : endLabel(w.endYM)}</b></div>
+                  {Number(loan.monthly) > 0 && (
+                    <div className="bd-row"><span>毎月つづける上乗せ</span><b>{yen(loan.monthly)}</b></div>
+                  )}
+                </div>
               </div>
             );
           })}
 
           <div className="bigdiff col">
-            <div className="bd-row"><span>最低返済だけ</span><b>{endLabel(endBase)}・利息 {yen(intBase)}</b></div>
-            <div className="bd-row"><span>上乗せしたら</span><b>{endLabel(endPlan)}・利息 {yen(intPlan)}</b></div>
+            <div className="bd-row"><span>上乗せなしなら</span><b>{endLabel(endBare)}・利息 {yen(intBare)}</b></div>
+            <div className="bd-row"><span>いまの計画だと</span><b>{endLabel(endPlan)}・利息 {yen(intPlan)}</b></div>
             <div className="bd-win">
-              {saveMonths > 0 ? `${saveMonths}か月みじかく、利息が${yen(intBase - intPlan)}へる` : "上乗せするとここに差が出ます"}
+              {saveMonths > 0 ? `${saveMonths}か月みじかく、利息が${yen(intBare - intPlan)}へる` : "上乗せするとここに差が出ます"}
             </div>
           </div>
 
           <p className="hint">
-            ボーナス月の上乗せは、借入先をタップした先で決められます。利息は「残高×年利÷365×その月の日数」の日割りで、実際は締め日の都合で数百円ずれます。
+            毎月きまった額を続けて入れたいときは、借入先をタップして「毎月つづける上乗せ」に入れてください。この画面はその月かぎりの上乗せです。
           </p>
         </section>
       )}
@@ -1265,8 +1304,13 @@ function LoanPage({ active }) {
       {editing && <LoanEditor loan={editing} onSave={save} onDelete={remove} onClose={() => setEditing(null)} />}
       {dataPane && (
         <LoanDataPane
-          data={{ loans }}
-          onImport={(v) => { setLoans(Array.isArray(v.loans) ? v.loans : []); setDataPane(false); }}
+          data={{ loans, plans, from }}
+          onImport={(v) => {
+            setLoans(Array.isArray(v.loans) ? v.loans : []);
+            setPlans(v.plans && typeof v.plans === "object" ? v.plans : {});
+            setFrom(v.from || todayYM());
+            setDataPane(false);
+          }}
           onClose={() => setDataPane(false)}
         />
       )}
@@ -1330,8 +1374,8 @@ function LoanEditor({ loan, onSave, onDelete, onClose }) {
   const [f, setF] = useState({ ...loan });
   const set = (k, v) => setF((p) => ({ ...p, [k]: v }));
   const p = presetById(f.preset);
-  const sim = simulate({ ...f, balance: Number(f.balance) || 0 }, todayYM(), { extra: 0, bonusAmount: 0, bonusMonths: [] });
-  const r0 = sim.rows[0];
+  const sim = walkLoan({ ...f, balance: Number(f.balance) || 0 }, todayYM(), {});
+  const r0 = sim.order.length ? sim.rows[sim.order[0]] : null;
   const due = requiredPay(f, Number(f.balance) || 0);
 
   return (
@@ -1385,9 +1429,9 @@ function LoanEditor({ loan, onSave, onDelete, onClose }) {
 
       <div className="two">
         <div className="row">
-          <span>毎月の上乗せ</span>
-          <input className="fld" type="number" inputMode="numeric" value={f.extra || 0}
-            onChange={(e) => set("extra", Math.max(0, Number(e.target.value) || 0))} />
+          <span>毎月つづける上乗せ</span>
+          <input className="fld" type="number" inputMode="numeric" value={f.monthly || 0}
+            onChange={(e) => set("monthly", Math.max(0, Number(e.target.value) || 0))} />
         </div>
         <div className="row">
           <span>ボーナス月の上乗せ</span>
@@ -1395,15 +1439,6 @@ function LoanEditor({ loan, onSave, onDelete, onClose }) {
             onChange={(e) => set("bonusAmount", Math.max(0, Number(e.target.value) || 0))} />
         </div>
       </div>
-      {(Number(f.extra) || 0) > 0 && (
-        <div className="row">
-          <span>上乗せをいつまで</span>
-          <div className="onceseg">
-            <button className={"k k-line sm" + (f.extraOnce !== false ? " on" : "")} onClick={() => set("extraOnce", true)}>今月だけ</button>
-            <button className={"k k-line sm" + (f.extraOnce === false ? " on" : "")} onClick={() => set("extraOnce", false)}>毎月つづける</button>
-          </div>
-        </div>
-      )}
       <div className="row">
         <span>ボーナス月</span>
         <div className="seg wrap">
@@ -1422,6 +1457,7 @@ function LoanEditor({ loan, onSave, onDelete, onClose }) {
           <div className="prev-row"><span>うち利息</span><b className="i-int">{yen(r0.interest)}</b></div>
           <div className="prev-row"><span>元金がへる額</span><b className="i-pri">{yen(r0.principal)}</b></div>
           <div className="prev-row"><span>完済まで</span><b>{sim.stuck ? "減りません" : `${sim.months}回`}</b></div>
+          <div className="prev-row"><span>完済する月</span><b>{sim.stuck || !sim.endYM ? "—" : `${parseYM(sim.endYM).y}年${parseYM(sim.endYM).m}月`}</b></div>
           <div className="prev-row"><span>利息の総額</span><b>{sim.stuck ? "—" : yen(sim.interestSum)}</b></div>
         </div>
       )}
@@ -1507,6 +1543,8 @@ function EarnPage({ active }) {
   const [picked, setPicked] = useState(null);
   const [dataPane, setDataPane] = useState(false);
   const [loans, setLoans] = useState([]);
+  const [loanPlans, setLoanPlans] = useState({});
+  const [loanFrom, setLoanFrom] = useState(todayYM());
   const [saveError, setSaveError] = useState(false);
 
   useEffect(() => {
@@ -1537,7 +1575,11 @@ function EarnPage({ active }) {
       try {
         const r = await storage.get(LOAN_KEY);
         const v = r ? JSON.parse(r.value) : null;
-        if (alive && v && Array.isArray(v.loans)) setLoans(v.loans);
+        if (alive && v && Array.isArray(v.loans)) {
+          setLoans(v.loans);
+          setLoanPlans(v.plans && typeof v.plans === "object" ? v.plans : {});
+          setLoanFrom(v.from || todayYM());
+        }
       } catch (e) {}
     })();
     return () => { alive = false; };
@@ -1567,16 +1609,15 @@ function EarnPage({ active }) {
   /* この月に出ていく返済額 */
   const need = useMemo(() => {
     if (!loans.length) return null;
-    const start = todayYM();
-    if (monthDiff(start, ym) < 0) return null;
+    if (monthDiff(loanFrom, ym) < 0) return null;
     let s = 0;
     loans.forEach((l) => {
-      const sim = simulate(l, start, { extra: 0, bonusAmount: 0, bonusMonths: [] });
-      const row = sim.rows.find((r) => r.ym === ym);
-      if (row) s += row.pay;
+      const w = walkLoan(l, loanFrom, loanPlans);
+      const r = w.rows[ym];
+      if (r) s += r.pay;
     });
     return s;
-  }, [loans, ym]);
+  }, [loans, loanPlans, loanFrom, ym]);
 
   const rest = need === null ? null : earned - need;
 
@@ -2151,6 +2192,10 @@ const CSS = `
 
 .pool-row.first{margin-top:0; padding-top:0; border-top:0; padding-bottom:9px;
   margin-bottom:8px; border-bottom:1.5px solid var(--case-d);}
+
+.cv.on span{background:var(--case-d); border-color:var(--edge);}
+.tbl tr.hi td{background:#E8F5EE;}
+.tbl tr.hi td:first-child{font-weight:800;}
 `;
 
 
