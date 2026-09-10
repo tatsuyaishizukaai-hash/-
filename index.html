@@ -933,6 +933,7 @@ function LoanPage() {
   const [bonusAmt, setBonusAmt] = useState(0);
   const [bonusOn, setBonusOn] = useState([]);
   const [saveError, setSaveError] = useState(false);
+  const [dataPane, setDataPane] = useState(false);
 
   const startYM = todayYM();
 
@@ -1022,7 +1023,7 @@ function LoanPage() {
       <div className="case">
         <div className="case-top">
           <span className="brand">返済プラン</span>
-          <span className="asof">{LOAN_ASOF}の目安</span>
+          <button className="chip" onClick={() => setDataPane(true)}>データ</button>
         </div>
 
         <div className="lcd">
@@ -1195,7 +1196,45 @@ function LoanPage() {
 
       {adding && <LoanPicker onPick={(p) => { setAdding(false); setEditing(mkLoan(p)); }} onClose={() => setAdding(false)} />}
       {editing && <LoanEditor loan={editing} onSave={save} onDelete={remove} onClose={() => setEditing(null)} />}
+      {dataPane && (
+        <LoanDataPane
+          data={{ loans, extra, bonusAmount: bonusAmt, bonusMonths: bonusOn }}
+          onImport={(v) => {
+            setLoans(Array.isArray(v.loans) ? v.loans : []);
+            setExtra(Number(v.extra) || 0);
+            setBonusAmt(Number(v.bonusAmount) || 0);
+            setBonusOn(Array.isArray(v.bonusMonths) ? v.bonusMonths : []);
+            setDataPane(false);
+          }}
+          onClose={() => setDataPane(false)}
+        />
+      )}
     </div>
+  );
+}
+
+/* ---------- 返済プランの持ち出し ---------- */
+function LoanDataPane({ data, onImport, onClose }) {
+  const [text, setText] = useState(JSON.stringify(data, null, 1));
+  const [msg, setMsg] = useState("");
+  return (
+    <Sheet title="データの持ち出し" onClose={onClose}>
+      <p className="hint">
+        入力したものはこの端末に自動で保存されています。この文字列をコピーしておけば、別の端末や引っ越し先のURLでも元どおりにできます。
+      </p>
+      <textarea className="fld area" value={text} onChange={(e) => setText(e.target.value)} spellCheck={false} />
+      <div className="foot">
+        <button className="k k-line flex" onClick={() => { navigator.clipboard?.writeText(text); setMsg("コピーしました"); }}>コピー</button>
+        <button className="k k-add flex" onClick={() => {
+          try {
+            const v = JSON.parse(text);
+            if (!v || !Array.isArray(v.loans)) throw new Error();
+            onImport(v);
+          } catch { setMsg("形式が違います。全文が貼られているか確かめてください。"); }
+        }}>読み込む</button>
+      </div>
+      {msg && <p className="hint">{msg}</p>}
+    </Sheet>
   );
 }
 
@@ -1587,7 +1626,7 @@ const CSS = `
   overflow-y:auto; overflow-x:hidden; scroll-snap-align:start; scroll-snap-stop:always;
   -webkit-overflow-scrolling:touch; background:#F1EEF7;
 }
-.page .sc{padding-bottom:96px;}
+.page .sc{padding-bottom:calc(124px + env(safe-area-inset-bottom));}
 .dots{
   position:fixed; left:0; right:0; bottom:0; z-index:40;
   display:flex; justify-content:center; gap:10px;
