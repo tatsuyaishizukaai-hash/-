@@ -984,7 +984,7 @@ function LoanPage({ active }) {
 
   /* 今月の約定合計と、上乗せに回せるお金 */
   const yakujo = base.reduce((s, p) => s + (p.sim.rows[0] ? p.sim.rows[0].pay : 0), 0);
-  const pool = Math.max(0, earned - yakujo);
+  const pool = earned;
   const allocated = loans.reduce((s, l) => s + (Number(l.extra) || 0), 0);
   const remain = pool - allocated;
   const setExtraFor = (id, v) =>
@@ -1169,9 +1169,9 @@ function LoanPage({ active }) {
       {!!loans.length && tab === "fast" && (
         <section className="list">
           <div className="pool">
-            <div className="pool-row"><span>かせぎカレンダーの今月</span><b>{yen(earned)}</b></div>
-            <div className="pool-row"><span>約定返済（最低限）</span><b>−{yen(yakujo)}</b></div>
-            <div className="pool-row bd"><span>上乗せに回せる</span><b>{yen(pool)}</b></div>
+            <div className="pool-row bd first"><span>上乗せに回せる</span><b>{yen(pool)}</b></div>
+            <div className="pool-row"><span>今月のかせぎから</span><b>{yen(earned)}</b></div>
+            <div className="pool-row"><span>割りふり済み</span><b>{yen(allocated)}</b></div>
             <div className="pool-bar" aria-hidden="true">
               <span style={{ width: Math.min(100, pool > 0 ? (allocated / pool) * 100 : allocated > 0 ? 100 : 0) + "%" }}
                 className={remain < 0 ? "over" : ""} />
@@ -1183,7 +1183,10 @@ function LoanPage({ active }) {
             </div>
           </div>
 
-          {earned === 0 && <p className="hint">かせぎカレンダーに何も入っていないと、回せる額は0のままです。まず「かせぎ」のページで日付に金額を入れてください。</p>}
+          <p className="hint">
+            ここで扱うのは上乗せぶんだけです。約定返済{yakujo > 0 ? `（毎月 ${yen(yakujo)}）` : ""}はこれとは別にかかります。
+            {earned === 0 && "　いまは「かせぎ」のページが空なので、回せる額は0のままです。"}
+          </p>
 
           {plan.map(({ loan, sim }) => {
             const b = base.find((x) => x.loan.id === loan.id);
@@ -2145,6 +2148,9 @@ const CSS = `
 
 .onceseg{display:flex; gap:7px; padding:2px 0 2px;}
 .onceseg .k{flex:1;}
+
+.pool-row.first{margin-top:0; padding-top:0; border-top:0; padding-bottom:9px;
+  margin-bottom:8px; border-bottom:1.5px solid var(--case-d);}
 `;
 
 
