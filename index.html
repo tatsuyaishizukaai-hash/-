@@ -923,15 +923,13 @@ const mkLoan = (p) => ({
 });
 
 /* ---------- 返済プランのページ ---------- */
-function LoanPage() {
+function LoanPage({ active }) {
   const [loans, setLoans] = useState([]);
   const [loaded, setLoaded] = useState(false);
   const [tab, setTab] = useState("list");
   const [editing, setEditing] = useState(null);
   const [adding, setAdding] = useState(false);
-  const [extra, setExtra] = useState(0);
-  const [bonusAmt, setBonusAmt] = useState(0);
-  const [bonusOn, setBonusOn] = useState([]);
+  const [earned, setEarned] = useState(0);
   const [saveError, setSaveError] = useState(false);
   const [dataPane, setDataPane] = useState(false);
 
@@ -943,12 +941,7 @@ function LoanPage() {
       let v = null;
       try { const r = await storage.get(LOAN_KEY); v = r ? JSON.parse(r.value) : null; } catch (e) {}
       if (!alive) return;
-      if (v && Array.isArray(v.loans)) {
-        setLoans(v.loans);
-        setExtra(Number(v.extra) || 0);
-        setBonusAmt(Number(v.bonusAmount) || 0);
-        setBonusOn(Array.isArray(v.bonusMonths) ? v.bonusMonths : []);
-      }
+      if (v && Array.isArray(v.loans)) setLoans(v.loans);
       setLoaded(true);
     })();
     return () => { alive = false; };
@@ -958,21 +951,42 @@ function LoanPage() {
     if (!loaded) return;
     (async () => {
       try {
-        await storage.set(LOAN_KEY, JSON.stringify({ loans, extra, bonusAmount: bonusAmt, bonusMonths: bonusOn }));
+        await storage.set(LOAN_KEY, JSON.stringify({ loans }));
         setSaveError(false);
       } catch (e) { setSaveError(true); }
     })();
-  }, [loans, extra, bonusAmt, bonusOn, loaded]);
+  }, [loans, loaded]);
+
+  /* このページを開くたび、かせぎカレンダーの今月ぶんを読み直す */
+  useEffect(() => {
+    if (!active) return;
+    let alive = true;
+    (async () => {
+      let v = null;
+      try { const r = await storage.get(EARN_KEY); v = r ? JSON.parse(r.value) : null; } catch (e) {}
+      if (!alive || !v) return;
+      const now = todayYM();
+      let s = 0;
+      Object.keys(v).forEach((k) => { if (k.slice(0, 7) === now) s += Number(v[k]?.amount) || 0; });
+      setEarned(s);
+    })();
+    return () => { alive = false; };
+  }, [active]);
 
   /* 素の計画（最低返済のみ）と、上乗せありの計画 */
   const base = useMemo(
     () => loans.map((l) => ({ loan: l, sim: simulate(l, startYM, { extra: 0, bonusAmount: 0, bonusMonths: [] }) })),
     [loans, startYM]
   );
-  const plan = useMemo(
-    () => loans.map((l) => ({ loan: l, sim: simulate(l, startYM, { extra, bonusAmount: bonusAmt, bonusMonths: bonusOn }) })),
-    [loans, startYM, extra, bonusAmt, bonusOn]
-  );
+  const plan = useMemo(() => loans.map((l) => ({ loan: l, sim: simulate(l, startYM) })), [loans, startYM]);
+
+  /* 今月の約定合計と、上乗せに回せるお金 */
+  const yakujo = base.reduce((s, p) => s + (p.sim.rows[0] ? p.sim.rows[0].pay : 0), 0);
+  const pool = Math.max(0, earned - yakujo);
+  const allocated = loans.reduce((s, l) => s + (Number(l.extra) || 0), 0);
+  const remain = pool - allocated;
+  const setExtraFor = (id, v) =>
+    setLoans((prev) => prev.map((l) => (l.id === id ? { ...l, extra: Math.max(0, Math.round(v) || 0) } : l)));
 
   const totalBal = loans.reduce((s, l) => s + (Number(l.balance) || 0), 0);
   const thisMonth = plan.reduce((s, p) => s + (p.sim.rows[0] ? p.sim.rows[0].pay : 0), 0);
@@ -1150,35 +1164,69 @@ function LoanPage() {
 
       {!!loans.length && tab === "fast" && (
         <section className="list">
-          <p className="sub">毎月の上乗せ</p>
-          <div className="seg wrap">
-            {[0, 3000, 5000, 10000, 20000, 30000].map((v) => (
-              <button key={v} className={"k k-line" + (extra === v ? " on" : "")} onClick={() => setExtra(v)}>
-                {v === 0 ? "なし" : "+" + num(v)}
-              </button>
-            ))}
-          </div>
-          <div className="row">
-            <span>自分で決める</span>
-            <input className="fld" type="number" inputMode="numeric" value={extra}
-              onChange={(e) => setExtra(Math.max(0, Number(e.target.value) || 0))} />
+          <div className="pool">
+            <div className="pool-row"><span>かせぎカレンダーの今月</span><b>{yen(earned)}</b></div>
+            <div className="pool-row"><span>約定返済（最低限）</span><b>−{yen(yakujo)}</b></div>
+            <div className="pool-row bd"><span>上乗せに回せる</span><b>{yen(pool)}</b></div>
+            <div className="pool-bar" aria-hidden="true">
+              <span style={{ width: Math.min(100, pool > 0 ? (allocated / pool) * 100 : allocated > 0 ? 100 : 0) + "%" }}
+                className={remain < 0 ? "over" : ""} />
+            </div>
+            <div className="pool-left">
+              {remain >= 0
+                ? <>まだ割りふれる <b>{yen(remain)}</b></>
+                : <b className="i-int">{yen(-remain)} 多く割りふっています</b>}
+            </div>
           </div>
 
-          <p className="sub">ボーナス払い</p>
-          <div className="seg wrap">
-            {[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12].map((m) => (
-              <button key={m} className={"k k-line sm" + (bonusOn.includes(m) ? " on" : "")}
-                onClick={() => setBonusOn((prev) => (prev.includes(m) ? prev.filter((x) => x !== m) : [...prev, m].sort((a, b) => a - b)))}>
-                {m}月
-              </button>
-            ))}
-          </div>
-          <div className="row">
-            <span>その月に上乗せする額</span>
-            <input className="fld" type="number" inputMode="numeric" value={bonusAmt}
-              onChange={(e) => setBonusAmt(Math.max(0, Number(e.target.value) || 0))} />
-          </div>
-          <p className="hint">上乗せぶんは、借入先が複数あるときはそれぞれに同じ額が乗ります。1社に集中させたいときは、その借入先を開いて設定してください。</p>
+          {earned === 0 && <p className="hint">かせぎカレンダーに何も入っていないと、回せる額は0のままです。まず「かせぎ」のページで日付に金額を入れてください。</p>}
+
+          {plan.map(({ loan, sim }) => {
+            const b = base.find((x) => x.loan.id === loan.id);
+            const r0 = sim.rows[0];
+            const due = b && b.sim.rows[0] ? b.sim.rows[0].pay : 0;
+            const ex = Number(loan.extra) || 0;
+            const add = (v) => setExtraFor(loan.id, ex + v);
+            const shorter = b && !sim.stuck && !b.sim.stuck ? b.sim.months - sim.months : 0;
+            const saved = b && !sim.stuck && !b.sim.stuck ? b.sim.interestSum - sim.interestSum : 0;
+            return (
+              <div className="alloc" key={loan.id}>
+                <div className="alloc-top">
+                  <b>{loan.name}</b>
+                  <span className="loan-bal">{yen(loan.balance)}</span>
+                </div>
+                <div className="alloc-sub">約定 {yen(due)}／今月はらう {yen(r0 ? r0.pay : due)}</div>
+
+                <div className="row">
+                  <span>上乗せする額</span>
+                  <input className="fld" type="number" inputMode="numeric" value={ex}
+                    onChange={(e) => setExtraFor(loan.id, Number(e.target.value) || 0)} />
+                </div>
+                <div className="quick">
+                  {[1000, 5000, 10000, 30000].map((v) => (
+                    <button key={v} className="k k-line sm" onClick={() => add(v)}>＋{num(v)}</button>
+                  ))}
+                  {remain > 0 && <button className="k k-line sm" onClick={() => add(remain)}>残り全部</button>}
+                  {ex > 0 && <button className="k k-line sm" onClick={() => setExtraFor(loan.id, 0)}>0にする</button>}
+                </div>
+
+                {r0 && (
+                  <div className="alloc-res">
+                    <div className="bd-row"><span>今月はらったあとの残高</span><b>{yen(r0.bal)}</b></div>
+                    <div className="bd-row"><span>うち元金がへる額</span><b className="i-pri">{yen(r0.principal)}</b></div>
+                    <div className="bd-row">
+                      <span>完済まで</span>
+                      <b>{sim.stuck ? "減りません" : `${sim.months}回`}{shorter > 0 ? `（${shorter}か月みじかく）` : ""}</b>
+                    </div>
+                    <div className="bd-row">
+                      <span>利息の総額</span>
+                      <b>{sim.stuck ? "—" : yen(sim.interestSum)}{saved > 0 ? ` （−${num(saved)}）` : ""}</b>
+                    </div>
+                  </div>
+                )}
+              </div>
+            );
+          })}
 
           <div className="bigdiff">
             <div className="bd-row"><span>最低返済だけ</span><b>{endLabel(endBase)}・利息 {yen(intBase)}</b></div>
@@ -1189,7 +1237,7 @@ function LoanPage() {
           </div>
 
           <p className="hint">
-            利息は「残高×年利÷365×その月の日数」で日割り計算しています。実際は返済日や締め日、手数料の有無で数百円ずれます。正確な数字は各社の明細で確認してください。
+            ボーナス月の上乗せは、借入先をタップした先で決められます。利息は「残高×年利÷365×その月の日数」の日割りで、実際は締め日の都合で数百円ずれます。
           </p>
         </section>
       )}
@@ -1198,14 +1246,8 @@ function LoanPage() {
       {editing && <LoanEditor loan={editing} onSave={save} onDelete={remove} onClose={() => setEditing(null)} />}
       {dataPane && (
         <LoanDataPane
-          data={{ loans, extra, bonusAmount: bonusAmt, bonusMonths: bonusOn }}
-          onImport={(v) => {
-            setLoans(Array.isArray(v.loans) ? v.loans : []);
-            setExtra(Number(v.extra) || 0);
-            setBonusAmt(Number(v.bonusAmount) || 0);
-            setBonusOn(Array.isArray(v.bonusMonths) ? v.bonusMonths : []);
-            setDataPane(false);
-          }}
+          data={{ loans }}
+          onImport={(v) => { setLoans(Array.isArray(v.loans) ? v.loans : []); setDataPane(false); }}
           onClose={() => setDataPane(false)}
         />
       )}
@@ -1368,11 +1410,332 @@ function LoanEditor({ loan, onSave, onDelete, onClose }) {
 
 
 /* ============================================================
-   2ページのシェル — 横にスクロールすると切り替わる
+   かせぎカレンダー — 日ごとに入った額を足して、今月返済に回せる額を出す
+   ============================================================ */
+const EARN_KEY = "subsapp:earn:v1";
+const WD_HEAD = ["日", "月", "火", "水", "木", "金", "土"];
+
+/* 祝日（1980〜2099年で成り立つ計算。2026年のシルバーウィークもこれで出る） */
+const nthMonday = (y, m, n) => {
+  const first = new Date(y, m - 1, 1).getDay();
+  return 1 + ((1 - first + 7) % 7) + (n - 1) * 7;
+};
+const equinoxDay = (y, spring) => {
+  const k = spring ? 20.8431 : 23.2488;
+  return Math.floor(k + 0.242194 * (y - 1980) - Math.floor((y - 1980) / 4));
+};
+const holidayCache = {};
+function holidaysOf(y) {
+  if (holidayCache[y]) return holidayCache[y];
+  const h = {};
+  const put = (m, d, name) => { h[`${m}-${d}`] = name; };
+  [[1, 1, "元日"], [2, 11, "建国記念の日"], [2, 23, "天皇誕生日"], [4, 29, "昭和の日"],
+   [5, 3, "憲法記念日"], [5, 4, "みどりの日"], [5, 5, "こどもの日"], [8, 11, "山の日"],
+   [11, 3, "文化の日"], [11, 23, "勤労感謝の日"]].forEach(([m, d, n]) => put(m, d, n));
+  put(1, nthMonday(y, 1, 2), "成人の日");
+  put(7, nthMonday(y, 7, 3), "海の日");
+  put(9, nthMonday(y, 9, 3), "敬老の日");
+  put(10, nthMonday(y, 10, 2), "スポーツの日");
+  put(3, equinoxDay(y, true), "春分の日");
+  put(9, equinoxDay(y, false), "秋分の日");
+
+  /* 祝日にはさまれた平日は国民の休日 */
+  Object.keys({ ...h }).forEach((k) => {
+    const [m, d] = k.split("-").map(Number);
+    const mid = new Date(y, m - 1, d + 1);
+    const nx = new Date(y, m - 1, d + 2);
+    const midKey = `${mid.getMonth() + 1}-${mid.getDate()}`;
+    const nxKey = `${nx.getMonth() + 1}-${nx.getDate()}`;
+    if (h[nxKey] && !h[midKey] && mid.getDay() !== 0 && mid.getFullYear() === y) h[midKey] = "国民の休日";
+  });
+  /* 日曜と重なったら次の平日が振替休日 */
+  const extra = {};
+  Object.keys({ ...h }).forEach((k) => {
+    const [m, d] = k.split("-").map(Number);
+    if (new Date(y, m - 1, d).getDay() !== 0) return;
+    let n = new Date(y, m - 1, d + 1);
+    while (h[`${n.getMonth() + 1}-${n.getDate()}`]) n = new Date(n.getFullYear(), n.getMonth(), n.getDate() + 1);
+    if (n.getFullYear() === y) extra[`${n.getMonth() + 1}-${n.getDate()}`] = "振替休日";
+  });
+  Object.assign(h, extra);
+  holidayCache[y] = h;
+  return h;
+}
+const holidayName = (y, m, d) => holidaysOf(y)[`${m}-${d}`] || null;
+
+const dayKey = (ym, d) => `${ym}-${pad2(d)}`;
+const todayKey = () => {
+  const t = new Date();
+  return `${t.getFullYear()}-${pad2(t.getMonth() + 1)}-${pad2(t.getDate())}`;
+};
+const compact = (n) => (n >= 1000000 ? Math.round(n / 10000) + "万" : String(Math.round(n)));
+
+/* ---------- かせぎカレンダー ---------- */
+function EarnPage({ active }) {
+  const [days, setDays] = useState({});
+  const [loaded, setLoaded] = useState(false);
+  const [ym, setYm] = useState(todayYM());
+  const [dir, setDir] = useState(1);
+  const [picked, setPicked] = useState(null);
+  const [dataPane, setDataPane] = useState(false);
+  const [loans, setLoans] = useState([]);
+  const [saveError, setSaveError] = useState(false);
+
+  useEffect(() => {
+    let alive = true;
+    (async () => {
+      let v = null;
+      try { const r = await storage.get(EARN_KEY); v = r ? JSON.parse(r.value) : null; } catch (e) {}
+      if (!alive) return;
+      if (v && typeof v === "object") setDays(v);
+      setLoaded(true);
+    })();
+    return () => { alive = false; };
+  }, []);
+
+  useEffect(() => {
+    if (!loaded) return;
+    (async () => {
+      try { await storage.set(EARN_KEY, JSON.stringify(days)); setSaveError(false); }
+      catch (e) { setSaveError(true); }
+    })();
+  }, [days, loaded]);
+
+  /* このページを開くたび、返済ページの内容を読み直す */
+  useEffect(() => {
+    if (!active) return;
+    let alive = true;
+    (async () => {
+      try {
+        const r = await storage.get(LOAN_KEY);
+        const v = r ? JSON.parse(r.value) : null;
+        if (alive && v && Array.isArray(v.loans)) setLoans(v.loans);
+      } catch (e) {}
+    })();
+    return () => { alive = false; };
+  }, [active]);
+
+  const { y, m } = parseYM(ym);
+  const dim = daysInMonth(y, m);
+  const lead = new Date(y, m - 1, 1).getDay();
+  const tKey = todayKey();
+  const isThisMonth = ym === todayYM();
+
+  const earned = useMemo(() => {
+    let s = 0;
+    for (let d = 1; d <= dim; d++) s += Number(days[dayKey(ym, d)]?.amount) || 0;
+    return s;
+  }, [days, ym, dim]);
+
+  const filled = useMemo(() => {
+    const out = [];
+    for (let d = 1; d <= dim; d++) {
+      const v = days[dayKey(ym, d)];
+      if (v && Number(v.amount)) out.push({ d, ...v });
+    }
+    return out;
+  }, [days, ym, dim]);
+
+  /* この月に出ていく返済額 */
+  const need = useMemo(() => {
+    if (!loans.length) return null;
+    const start = todayYM();
+    if (monthDiff(start, ym) < 0) return null;
+    let s = 0;
+    loans.forEach((l) => {
+      const sim = simulate(l, start, { extra: 0, bonusAmount: 0, bonusMonths: [] });
+      const row = sim.rows.find((r) => r.ym === ym);
+      if (row) s += row.pay;
+    });
+    return s;
+  }, [loans, ym]);
+
+  const rest = need === null ? null : earned - need;
+
+  const jump = (next) => { setDir(next > ym ? 1 : -1); setYm(next); };
+  const putDay = (key, amount, note) => {
+    setDays((prev) => {
+      const n = { ...prev };
+      if (!amount) delete n[key];
+      else n[key] = { amount, note: note || "" };
+      return n;
+    });
+    setPicked(null);
+  };
+
+  const cells = [];
+  for (let i = 0; i < lead; i++) cells.push(null);
+  for (let d = 1; d <= dim; d++) cells.push(d);
+
+  return (
+    <div className="sc">
+      <div className="case">
+        <div className="case-top">
+          <span className="brand">かせぎカレンダー</span>
+          <button className="chip" onClick={() => setDataPane(true)}>データ</button>
+        </div>
+
+        <div className="lcd">
+          <div className="lcd-row">
+            <button className="nav" onClick={() => jump(addMonths(ym, -1))} aria-label="前の月">◀</button>
+            <span className={"lcd-ym " + (dir > 0 ? "dr" : "dl")} key={ym}>{y}<i>年</i>{m}<i>月</i></span>
+            <button className="nav" onClick={() => jump(addMonths(ym, 1))} aria-label="次の月">▶</button>
+          </div>
+
+          <Rolling value={earned} className="lcd-total" />
+          <div className="lcd-row">
+            <span className="lcd-small">{m}月に入ったお金（{filled.length}日ぶん）</span>
+          </div>
+
+          <div className="lcd-foot">
+            <span>返済に必要 {need === null ? "—" : yen(need)}</span>
+            <span>{rest === null ? "" : rest >= 0 ? `残せる ${yen(rest)}` : `足りない ${yen(-rest)}`}</span>
+          </div>
+        </div>
+
+        <div className="keys2">
+          {!isThisMonth && <button className="k sm now" onClick={() => jump(todayYM())}>今月</button>}
+        </div>
+      </div>
+
+      {saveError && <p className="warn">保存できませんでした。「データ」から控えを取っておいてください。</p>}
+
+      <section className="list">
+        <div className="cal-head">
+          {WD_HEAD.map((w, i) => (
+            <span key={w} className={i === 0 ? "sun" : i === 6 ? "sat" : ""}>{w}</span>
+          ))}
+        </div>
+        <div className="cal">
+          {cells.map((d, i) => {
+            if (d === null) return <span className="cal-x" key={"x" + i} />;
+            const key = dayKey(ym, d);
+            const v = days[key];
+            const wd = (lead + d - 1) % 7;
+            const hol = holidayName(y, m, d);
+            const cls =
+              "cal-d" +
+              (v && Number(v.amount) ? " has" : "") +
+              (key === tKey ? " today" : "") +
+              (hol || wd === 0 ? " sun" : wd === 6 ? " sat" : "");
+            return (
+              <button key={key} className={cls} onClick={() => setPicked({ key, d, hol })}>
+                <em>{d}</em>
+                {v && Number(v.amount) ? <i>+{compact(v.amount)}</i> : null}
+                {hol && !(v && Number(v.amount)) ? <u>{hol.length > 4 ? hol.slice(0, 3) + "…" : hol}</u> : null}
+              </button>
+            );
+          })}
+        </div>
+
+        <p className="hint">日付をタップすると、その日に入った額を入れられます。赤い日は日曜と祝日です。</p>
+
+        {!!filled.length && (
+          <>
+            <p className="sub">この月の内わけ</p>
+            {filled.map((f) => (
+              <button key={f.d} className="item" onClick={() => setPicked({ key: dayKey(ym, f.d), d: f.d, hol: holidayName(y, m, f.d) })}>
+                <span className="item-main">
+                  <b>{m}月{f.d}日（{WD_HEAD[(lead + f.d - 1) % 7]}）</b>
+                  {f.note && <small>{f.note}</small>}
+                </span>
+                <span className="item-yen i-pri">+{num(f.amount)}</span>
+              </button>
+            ))}
+            <div className="total-line">
+              <span>合計</span>
+              <b>{yen(earned)}</b>
+            </div>
+          </>
+        )}
+
+        {!filled.length && <p className="hint big-hint">まだこの月の記録はありません。カレンダーの日付から入れてください。</p>}
+
+        {need !== null && (
+          <div className="bigdiff">
+            <div className="bd-row"><span>{m}月に入ったお金</span><b>{yen(earned)}</b></div>
+            <div className="bd-row"><span>返済にいる額</span><b>{yen(need)}</b></div>
+            <div className="bd-win">
+              {rest >= 0 ? `返して ${yen(rest)} 残ります` : `${yen(-rest)} 足りません`}
+            </div>
+          </div>
+        )}
+      </section>
+
+      {picked && (
+        <DayEditor
+          ymd={picked.key} d={picked.d} month={m} hol={picked.hol}
+          value={days[picked.key]}
+          onSave={putDay}
+          onClose={() => setPicked(null)}
+        />
+      )}
+      {dataPane && (
+        <EarnDataPane data={days} onImport={(v) => { setDays(v); setDataPane(false); }} onClose={() => setDataPane(false)} />
+      )}
+    </div>
+  );
+}
+
+/* ---------- その日の入力 ---------- */
+function DayEditor({ ymd, d, month, hol, value, onSave, onClose }) {
+  const [amount, setAmount] = useState(value ? String(value.amount) : "");
+  const [note, setNote] = useState(value ? value.note || "" : "");
+  const n = Math.max(0, Number(amount) || 0);
+  return (
+    <Sheet title={`${month}月${d}日${hol ? "・" + hol : ""}`} onClose={onClose}>
+      <div className="row">
+        <span>この日に入った額</span>
+        <input className="fld big" type="number" inputMode="numeric" autoFocus
+          value={amount} onChange={(e) => setAmount(e.target.value)} placeholder="50000" />
+      </div>
+      <div className="quick">
+        {[1000, 3000, 5000, 10000, 30000, 50000].map((v) => (
+          <button key={v} className="k k-line sm" onClick={() => setAmount(String(n + v))}>+{num(v)}</button>
+        ))}
+      </div>
+      <div className="row">
+        <span>メモ（何のお金か）</span>
+        <input className="fld" value={note} onChange={(e) => setNote(e.target.value)} placeholder="給料・バイト・売上など" />
+      </div>
+      <div className="foot">
+        {value && <button className="k k-del" onClick={() => onSave(ymd, 0, "")}>消す</button>}
+        <button className="k k-add own" onClick={() => onSave(ymd, n, note)}>保存する</button>
+      </div>
+    </Sheet>
+  );
+}
+
+/* ---------- カレンダーの持ち出し ---------- */
+function EarnDataPane({ data, onImport, onClose }) {
+  const [text, setText] = useState(JSON.stringify(data, null, 1));
+  const [msg, setMsg] = useState("");
+  return (
+    <Sheet title="データの持ち出し" onClose={onClose}>
+      <p className="hint">入れたものはこの端末に自動で保存されています。この文字列を控えておけば、あとから元どおりにできます。</p>
+      <textarea className="fld area" value={text} onChange={(e) => setText(e.target.value)} spellCheck={false} />
+      <div className="foot">
+        <button className="k k-line flex" onClick={() => { navigator.clipboard?.writeText(text); setMsg("コピーしました"); }}>コピー</button>
+        <button className="k k-add flex" onClick={() => {
+          try {
+            const v = JSON.parse(text);
+            if (!v || typeof v !== "object" || Array.isArray(v)) throw new Error();
+            onImport(v);
+          } catch { setMsg("形式が違います。全文が貼られているか確かめてください。"); }
+        }}>読み込む</button>
+      </div>
+      {msg && <p className="hint">{msg}</p>}
+    </Sheet>
+  );
+}
+
+/* ============================================================
+   3ページのシェル — 横にスクロールすると切り替わる
    ============================================================ */
 const PAGES = [
   { key: "subs", label: "固定費" },
   { key: "loan", label: "返済" },
+  { key: "earn", label: "かせぎ" },
 ];
 
 function App() {
@@ -1397,7 +1760,8 @@ function App() {
       <style>{CSS}</style>
       <div className="pager" ref={ref} onScroll={onScroll}>
         <div className="page"><SubsPage /></div>
-        <div className="page"><LoanPage /></div>
+        <div className="page"><LoanPage active={page === 1} /></div>
+        <div className="page"><EarnPage active={page === 2} /></div>
       </div>
       <div className="dots" role="tablist">
         {PAGES.map((p, i) => (
@@ -1578,11 +1942,11 @@ const CSS = `
 .empty-lead{font-size:17px; font-weight:800; margin:0;}
 
 /* ── シート ── */
-.ov{position:fixed; inset:0; background:rgba(50,48,72,.42); display:flex; align-items:flex-end; justify-content:center; z-index:50; animation:fade .2s ease-out;}
+.ov{position:fixed; inset:0; background:rgba(50,48,72,.42); display:flex; align-items:flex-end; justify-content:center; z-index:120; animation:fade .2s ease-out;}
 @keyframes fade{from{opacity:0;}to{opacity:1;}}
 .sheet{
   background:var(--paper); width:100%; max-width:640px; max-height:92vh; overflow:auto;
-  border-radius:20px 20px 0 0; border-top:5px solid var(--case); padding:16px 16px 28px;
+  border-radius:20px 20px 0 0; border-top:5px solid var(--case); padding:16px 16px calc(40px + env(safe-area-inset-bottom));
   animation:up .32s cubic-bezier(.22,1,.36,1);
 }
 @keyframes up{from{transform:translateY(60px);}to{transform:none;}}
@@ -1630,14 +1994,14 @@ const CSS = `
 .dots{
   position:fixed; left:0; right:0; bottom:0; z-index:40;
   display:flex; justify-content:center; gap:10px;
-  padding:9px 12px calc(9px + env(safe-area-inset-bottom));
-  background:rgba(241,238,247,.94); border-top:2px solid #3B4150;
-  backdrop-filter:blur(6px);
+  padding:8px 10px calc(8px + env(safe-area-inset-bottom));
+  background:#F1EEF7; border-top:2px solid #3B4150;
 }
+.shell:has(.ov) .dots{opacity:0; pointer-events:none;}
 .dotbtn{
-  display:flex; align-items:center; gap:7px; border:2px solid #3B4150;
+  display:flex; align-items:center; gap:6px; border:2px solid #3B4150;
   border-bottom-width:4px; border-radius:10px; background:#fff; color:#252932;
-  font-family:inherit; font-size:12.5px; font-weight:800; padding:8px 15px; cursor:pointer;
+  font-family:inherit; font-size:12px; font-weight:800; padding:8px 12px; cursor:pointer;
 }
 .dotbtn.on{background:#AEBBDD; border-color:#96A3C4;}
 .dotbtn i{width:8px; height:8px; border-radius:50%; background:#96A3C4; display:block;}
@@ -1699,6 +2063,50 @@ const CSS = `
   .pager{scroll-behavior:auto;}
   .cv span{transition:none;}
 }
+
+/* ── かせぎカレンダー ── */
+.cal-head{display:grid; grid-template-columns:repeat(7,1fr); gap:3px; padding:2px 0 6px;}
+.cal-head span{text-align:center; font-size:11px; font-weight:800; color:#3E4453;}
+.cal-head .sun{color:var(--up-t);}
+.cal-head .sat{color:#2F6FB0;}
+.cal{display:grid; grid-template-columns:repeat(7,1fr); gap:3px;}
+.cal-x{display:block;}
+.cal-d{
+  position:relative; display:flex; flex-direction:column; align-items:center; justify-content:flex-start;
+  gap:1px; aspect-ratio:1 / 1.15; padding:4px 1px 2px; background:#fff; overflow:hidden;
+  border:1.5px solid var(--edge); border-radius:7px; font-family:inherit; color:var(--ink);
+}
+.cal-d:active{transform:translateY(1px);}
+.cal-d em{font-style:normal; font-size:12.5px; font-weight:700; line-height:1; font-variant-numeric:tabular-nums;}
+.cal-d i{font-style:normal; font-size:8.5px; font-weight:800; line-height:1.15; color:var(--down-t); letter-spacing:-.03em;}
+.cal-d u{text-decoration:none; font-size:7.5px; line-height:1.15; color:var(--up-t);}
+.cal-d.sun em{color:var(--up-t);}
+.cal-d.sat em{color:#2F6FB0;}
+.cal-d.has{background:#E8F5EE; border-color:var(--down-t);}
+.cal-d.today{box-shadow:inset 0 0 0 2px var(--orange-e);}
+.quick{display:flex; flex-wrap:wrap; gap:7px; padding:2px 0 4px;}
+
+/* ── 上乗せの割りふり ── */
+.pool{background:var(--case); border:2px solid var(--edge); border-radius:11px;
+  padding:13px 14px; margin-bottom:14px; color:var(--case-ink);}
+.pool-row{display:flex; justify-content:space-between; gap:10px; padding:2px 0;
+  font-size:12.5px; font-weight:600; font-variant-numeric:tabular-nums;}
+.pool-row b{font-weight:800;}
+.pool-row.bd{margin-top:6px; padding-top:8px; border-top:1.5px solid var(--case-d); font-size:14px;}
+.pool-row.bd b{font-size:17px;}
+.pool-bar{height:10px; margin-top:10px; background:#fff; border:1.5px solid var(--edge);
+  border-radius:5px; overflow:hidden;}
+.pool-bar span{display:block; height:100%; background:var(--down-t); transition:width .3s ease-out;}
+.pool-bar span.over{background:var(--up-t);}
+.pool-left{padding-top:7px; font-size:12px; font-weight:700; font-variant-numeric:tabular-nums;}
+.pool-left b{font-size:14px;}
+.alloc{background:#fff; border:2px solid var(--edge); border-bottom-width:4px; border-radius:11px;
+  padding:13px 14px; margin-bottom:12px;}
+.alloc-top{display:flex; justify-content:space-between; align-items:baseline; gap:10px;}
+.alloc-top b{font-size:14.5px;}
+.alloc-sub{font-size:11.5px; color:#5B6070; font-weight:600; padding-top:3px;}
+.alloc-res{margin-top:10px; padding-top:9px; border-top:1.5px solid #D5D0E1;}
+.alloc .row{padding:8px 0 4px;}
 `;
 
 
