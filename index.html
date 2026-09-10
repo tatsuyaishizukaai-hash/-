@@ -875,6 +875,7 @@ function requiredPay(loan, bal) {
 /* 完済までを1か月ずつ積む */
 function simulate(loan, startYM, opt = {}) {
   const extra = Math.max(0, Number(opt.extra ?? loan.extra) || 0);
+  const onceOnly = (opt.extraOnce ?? loan.extraOnce) !== false;
   const bonusAmt = Math.max(0, Number(opt.bonusAmount ?? loan.bonusAmount) || 0);
   const bonusMonths = opt.bonusMonths ?? loan.bonusMonths ?? [];
   const apr = (Number(loan.apr) || 0) / 100;
@@ -890,7 +891,7 @@ function simulate(loan, startYM, opt = {}) {
     const days = daysInMonth(y, m);
     const interest = Math.round(bal * apr / 365 * days);
     const due = loan.reslide ? requiredPay(loan, bal) : fixedDue;
-    let pay = (loan.method === "prin" ? due + interest : due) + extra;
+    let pay = (loan.method === "prin" ? due + interest : due) + (onceOnly && i > 0 ? 0 : extra);
     if (bonusMonths.includes(m)) pay += bonusAmt;
     if (pay >= bal + interest) pay = bal + interest;
     const principal = pay - interest;
@@ -917,6 +918,7 @@ const mkLoan = (p) => ({
   fixed: p && p.fixed ? p.fixed : 10000,
   reslide: false,
   extra: 0,
+  extraOnce: true,
   bonusMonths: [],
   bonusAmount: 0,
   note: p ? p.note : "",
@@ -987,6 +989,8 @@ function LoanPage({ active }) {
   const remain = pool - allocated;
   const setExtraFor = (id, v) =>
     setLoans((prev) => prev.map((l) => (l.id === id ? { ...l, extra: Math.max(0, Math.round(v) || 0) } : l)));
+  const setOnceFor = (id, v) =>
+    setLoans((prev) => prev.map((l) => (l.id === id ? { ...l, extraOnce: v } : l)));
 
   const totalBal = loans.reduce((s, l) => s + (Number(l.balance) || 0), 0);
   const thisMonth = plan.reduce((s, p) => s + (p.sim.rows[0] ? p.sim.rows[0].pay : 0), 0);
@@ -1186,6 +1190,7 @@ function LoanPage({ active }) {
             const r0 = sim.rows[0];
             const due = b && b.sim.rows[0] ? b.sim.rows[0].pay : 0;
             const ex = Number(loan.extra) || 0;
+            const once = loan.extraOnce !== false;
             const add = (v) => setExtraFor(loan.id, ex + v);
             const shorter = b && !sim.stuck && !b.sim.stuck ? b.sim.months - sim.months : 0;
             const saved = b && !sim.stuck && !b.sim.stuck ? b.sim.interestSum - sim.interestSum : 0;
@@ -1210,6 +1215,13 @@ function LoanPage({ active }) {
                   {ex > 0 && <button className="k k-line sm" onClick={() => setExtraFor(loan.id, 0)}>0にする</button>}
                 </div>
 
+                {ex > 0 && (
+                  <div className="onceseg">
+                    <button className={"k k-line sm" + (once ? " on" : "")} onClick={() => setOnceFor(loan.id, true)}>今月だけ</button>
+                    <button className={"k k-line sm" + (!once ? " on" : "")} onClick={() => setOnceFor(loan.id, false)}>毎月つづける</button>
+                  </div>
+                )}
+
                 {r0 && (
                   <div className="alloc-res">
                     <div className="bd-row"><span>今月はらったあとの残高</span><b>{yen(r0.bal)}</b></div>
@@ -1217,6 +1229,10 @@ function LoanPage({ active }) {
                     <div className="bd-row">
                       <span>完済まで</span>
                       <b>{sim.stuck ? "減りません" : `${sim.months}回`}{shorter > 0 ? `（${shorter}か月みじかく）` : ""}</b>
+                    </div>
+                    <div className="bd-row">
+                      <span>上乗せのしかた</span>
+                      <b>{once ? "今月だけ" : "毎月つづける"}</b>
                     </div>
                     <div className="bd-row">
                       <span>利息の総額</span>
@@ -1228,7 +1244,7 @@ function LoanPage({ active }) {
             );
           })}
 
-          <div className="bigdiff">
+          <div className="bigdiff col">
             <div className="bd-row"><span>最低返済だけ</span><b>{endLabel(endBase)}・利息 {yen(intBase)}</b></div>
             <div className="bd-row"><span>上乗せしたら</span><b>{endLabel(endPlan)}・利息 {yen(intPlan)}</b></div>
             <div className="bd-win">
@@ -1366,7 +1382,7 @@ function LoanEditor({ loan, onSave, onDelete, onClose }) {
 
       <div className="two">
         <div className="row">
-          <span>この借入先だけ上乗せ</span>
+          <span>毎月の上乗せ</span>
           <input className="fld" type="number" inputMode="numeric" value={f.extra || 0}
             onChange={(e) => set("extra", Math.max(0, Number(e.target.value) || 0))} />
         </div>
@@ -1376,6 +1392,15 @@ function LoanEditor({ loan, onSave, onDelete, onClose }) {
             onChange={(e) => set("bonusAmount", Math.max(0, Number(e.target.value) || 0))} />
         </div>
       </div>
+      {(Number(f.extra) || 0) > 0 && (
+        <div className="row">
+          <span>上乗せをいつまで</span>
+          <div className="onceseg">
+            <button className={"k k-line sm" + (f.extraOnce !== false ? " on" : "")} onClick={() => set("extraOnce", true)}>今月だけ</button>
+            <button className={"k k-line sm" + (f.extraOnce === false ? " on" : "")} onClick={() => set("extraOnce", false)}>毎月つづける</button>
+          </div>
+        </div>
+      )}
       <div className="row">
         <span>ボーナス月</span>
         <div className="seg wrap">
@@ -1652,7 +1677,7 @@ function EarnPage({ active }) {
         {!filled.length && <p className="hint big-hint">まだこの月の記録はありません。カレンダーの日付から入れてください。</p>}
 
         {need !== null && (
-          <div className="bigdiff">
+          <div className="bigdiff col">
             <div className="bd-row"><span>{m}月に入ったお金</span><b>{yen(earned)}</b></div>
             <div className="bd-row"><span>返済にいる額</span><b>{yen(need)}</b></div>
             <div className="bd-win">
@@ -2107,6 +2132,19 @@ const CSS = `
 .alloc-sub{font-size:11.5px; color:#5B6070; font-weight:600; padding-top:3px;}
 .alloc-res{margin-top:10px; padding-top:9px; border-top:1.5px solid #D5D0E1;}
 .alloc .row{padding:8px 0 4px;}
+
+/* ── 縦積みのまとめ枠 ── */
+.bigdiff.col{display:block; font-size:12.5px; font-weight:600;}
+.bigdiff.col b{font-size:14px; font-family:inherit; font-weight:800;}
+.bd-row{align-items:baseline;}
+.bd-row>span{white-space:nowrap; flex:0 0 auto; color:var(--case-ink);}
+.bd-row>b{flex:1; text-align:right; min-width:0;}
+.bd-win{line-height:1.5;}
+.total-line b{font-size:22px; font-weight:800; font-variant-numeric:tabular-nums;}
+.alloc-res .bd-row>span{color:#3E4453;}
+
+.onceseg{display:flex; gap:7px; padding:2px 0 2px;}
+.onceseg .k{flex:1;}
 `;
 
 
