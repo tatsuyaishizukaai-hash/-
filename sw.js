@@ -1,5 +1,5 @@
 /* 一度開けば、あとは電波がなくても起動できるようにする */
-const CACHE = "subscalc-v1";
+const CACHE = "subscalc-v2";
 const CORE = [
   "./",
   "./index.html",

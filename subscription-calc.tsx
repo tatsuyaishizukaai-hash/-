@@ -1,47 +1,4 @@
-<!doctype html>
-<html lang="ja">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
-<title>サブスク電卓</title>
-
-<link rel="manifest" href="manifest.webmanifest">
-<meta name="theme-color" content="#BFC9E4">
-<meta name="mobile-web-app-capable" content="yes">
-<meta name="apple-mobile-web-app-capable" content="yes">
-<meta name="apple-mobile-web-app-status-bar-style" content="default">
-<meta name="apple-mobile-web-app-title" content="サブスク電卓">
-<link rel="apple-touch-icon" href="icon-180.png">
-<link rel="icon" href="icon-180.png">
-
-<style>
-  html, body { margin:0; padding:0; height:100%; background:#BFC9E4; overscroll-behavior:none; }
-  body { -webkit-tap-highlight-color:transparent; }
-  #root { height:100%; }
-  .sc { -webkit-touch-callout:none; -webkit-user-select:none; user-select:none; }
-  .sc input, .sc textarea, .sc select { -webkit-user-select:text; user-select:text; }
-  /* ノッチとホームバーを避ける */
-  .shell .case { padding-top:calc(14px + env(safe-area-inset-top)); }
-  body .sheet { padding-bottom:calc(28px + env(safe-area-inset-bottom)); }
-  #boot { padding:80px 24px; text-align:center; color:#3E4453;
-          font-family:"Hiragino Sans","Noto Sans JP",system-ui,sans-serif; font-size:13px; }
-</style>
-
-<script src="https://unpkg.com/react@18/umd/react.production.min.js" crossorigin></script>
-<script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js" crossorigin></script>
-<script src="https://unpkg.com/@babel/standalone@7/babel.min.js" crossorigin></script>
-</head>
-<body>
-<div id="root"><div id="boot">読み込んでいます…</div></div>
-
-<script type="text/babel" data-presets="react">
-/* 保存先：この端末のブラウザ内（localStorage） */
-const storage = {
-  async get(k) { const v = localStorage.getItem(k); return v === null ? null : { value: v }; },
-  async set(k, v) { localStorage.setItem(k, v); },
-};
-
-const { useState, useEffect, useMemo, useRef } = React;
+import React, { useState, useEffect, useMemo, useRef } from "react";
 
 /* ============================================================
    サブスク電卓 — 毎月の固定費をぜんぶ足して、先月と見くらべる
@@ -303,8 +260,8 @@ function SubsPage() {
     let alive = true;
     (async () => {
       let v = null;
-      try { const r = await storage.get(KEY_V2); v = r ? JSON.parse(r.value) : null; } catch (e) {}
-      if (!v) { try { const r = await storage.get(KEY_V1); v = r ? JSON.parse(r.value) : null; } catch (e) {} }
+      try { const r = await window.storage.get(KEY_V2); v = r ? JSON.parse(r.value) : null; } catch (e) {}
+      if (!v) { try { const r = await window.storage.get(KEY_V1); v = r ? JSON.parse(r.value) : null; } catch (e) {} }
       if (alive && v) {
         setSubs((Array.isArray(v.subs) ? v.subs : []).map(migrate));
         if (v.mode) setMode(v.mode);
@@ -318,7 +275,7 @@ function SubsPage() {
     if (!loaded) return;
     (async () => {
       try {
-        await storage.set(KEY_V2, JSON.stringify({ subs, mode }));
+        await window.storage.set(KEY_V2, JSON.stringify({ subs, mode }));
         setSaveError(false);
       } catch (e) { setSaveError(true); }
     })();
@@ -940,7 +897,7 @@ function LoanPage() {
     let alive = true;
     (async () => {
       let v = null;
-      try { const r = await storage.get(LOAN_KEY); v = r ? JSON.parse(r.value) : null; } catch (e) {}
+      try { const r = await window.storage.get(LOAN_KEY); v = r ? JSON.parse(r.value) : null; } catch (e) {}
       if (!alive) return;
       if (v && Array.isArray(v.loans)) {
         setLoans(v.loans);
@@ -957,7 +914,7 @@ function LoanPage() {
     if (!loaded) return;
     (async () => {
       try {
-        await storage.set(LOAN_KEY, JSON.stringify({ loans, extra, bonusAmount: bonusAmt, bonusMonths: bonusOn }));
+        await window.storage.set(LOAN_KEY, JSON.stringify({ loans, extra, bonusAmount: bonusAmt, bonusMonths: bonusOn }));
         setSaveError(false);
       } catch (e) { setSaveError(true); }
     })();
@@ -1336,7 +1293,7 @@ const PAGES = [
   { key: "loan", label: "返済" },
 ];
 
-function App() {
+export default function App() {
   const [page, setPage] = useState(0);
   const ref = useRef(null);
 
@@ -1661,15 +1618,3 @@ const CSS = `
   .cv span{transition:none;}
 }
 `;
-
-
-ReactDOM.createRoot(document.getElementById("root")).render(<App />);
-</script>
-
-<script>
-  if ("serviceWorker" in navigator) {
-    window.addEventListener("load", () => navigator.serviceWorker.register("sw.js").catch(() => {}));
-  }
-</script>
-</body>
-</html>
